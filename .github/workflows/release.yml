@@ -1,15 +1,28 @@
-# Legitimate Trusted-Publishing publish. Used once to "validate" the
-# configuration (npm docs: first successful publish binds the configuration
-# to the repository's immutable identity).
+# ONE workflow file, because npm's binding includes the workflow file name
+# (claims.workflow_ref.file = release.yml). A probe from any other file name
+# fails the claim match before the identity check is reached.
+#
+#   mode=publish  → real Trusted-Publishing publish (validates the config)
+#   mode=probe    → mint OIDC token, POST to the exchange endpoint, print
+#                   status + body (token redacted). Never publishes.
 name: release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to publish (e.g. 0.0.2)"
+      mode:
+        description: "publish | probe"
         required: true
+        default: "probe"
+      version:
+        description: "publish: version to publish (e.g. 0.0.2)"
+        required: false
+        default: ""
+      package:
+        description: "probe: package name (e.g. @scope/name)"
+        required: false
+        default: ""
 jobs:
-  publish:
+  run:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -20,15 +33,9 @@ jobs:
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      # Node 22's bundled npm is 10.9.x, which has NO OIDC token exchange at all
-      # (it only uses the Actions OIDC token for Sigstore). Trusted Publishing
-      # needs npm >= 11.5.1, so install the current CLI explicitly.
-      - name: Install current npm CLI
-        run: npm install -g npm@latest
-      - name: Show npm version and OIDC claims
+      - name: Show OIDC claims (this file's workflow_ref must match the binding)
         shell: bash
         run: |
-          npm --version
           IDTOK=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" | jq -r .value)
           echo "::add-mask::$IDTOK"
@@ -36,21 +43,62 @@ jobs:
           import sys, json, base64
           p = sys.argv[1].split(".")[1]; p += "=" * (-len(p) % 4)
           c = json.loads(base64.urlsafe_b64decode(p))
-          print(json.dumps({k: c.get(k) for k in ("sub","repository","repository_id","repository_owner","repository_owner_id","workflow_ref","ref","event_name")}, indent=2))
+          keys = ["sub","repository","repository_id","repository_owner","repository_owner_id","workflow_ref","job_workflow_ref","ref","event_name","jti"]
+          print(json.dumps({k: c.get(k) for k in keys}, indent=2))
           PY
+
+      # ---------------------------------------------------------------- publish
+      - name: Install current npm CLI (Node 22 bundles npm 10, which has no OIDC exchange)
+        if: inputs.mode == 'publish'
+        run: npm install -g npm@latest && npm --version
       - name: Bump version (no git tag, no commit)
+        if: inputs.mode == 'publish'
         run: npm version "${{ inputs.version }}" --no-git-tag-version
       - name: Publish via Trusted Publishing
-        # --loglevel verbose so the OIDC exchange request/response (and any
-        # "OIDC token exchange error - ..." message) shows up in the run log.
+        if: inputs.mode == 'publish'
         shell: bash
         run: |
           set +e
           npm publish --provenance --access public --loglevel verbose > /tmp/publish.log 2>&1
           rc=$?
-          grep -v -E '^npm (verb|sill|http) ' /tmp/publish.log
+          grep -v -E '^npm (verb|verbose|sill|silly|http) ' /tmp/publish.log
           echo "--- OIDC log lines ---"
-          grep -E '^npm verb oidc' /tmp/publish.log || echo "(none — the CLI never attempted an exchange?)"
+          grep -E '^npm verb(ose)? oidc' /tmp/publish.log || echo "(none — the CLI never attempted an exchange?)"
           exit $rc
-      - name: Confirm the version landed
-        run: npm view "$(node -p 'require("./package.json").name')@${{ inputs.version }}" version
+      - name: Wait for the version to become visible (post-publish processing)
+        if: inputs.mode == 'publish'
+        shell: bash
+        run: |
+          NAME=$(node -p 'require("./package.json").name')
+          for i in $(seq 1 20); do
+            if npm view "$NAME@${{ inputs.version }}" version >/dev/null 2>&1; then echo "visible after ~$((i*15))s"; exit 0; fi
+            sleep 15
+          done
+          echo "still not visible after 5 min (the PUT may still have succeeded — check manually)"; exit 1
+
+      # ---------------------------------------------------------------- probe
+      - name: Exchange probe (no publish)
+        if: inputs.mode == 'probe'
+        shell: bash
+        env:
+          PKG: ${{ inputs.package }}
+        run: |
+          set -uo pipefail
+          IDTOK=$(curl -sSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" | jq -r .value)
+          echo "::add-mask::$IDTOK"
+          ENC=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PKG")
+          URL="https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${ENC}"
+          echo "POST $URL"
+          HTTP=$(curl -sSL -o /tmp/resp.json -w "%{http_code}" -D /tmp/resp.headers \
+            -X POST -H "Authorization: Bearer $IDTOK" -H "Accept: application/json" "$URL")
+          echo "HTTP_STATUS: $HTTP"
+          grep -i -E '^(date|x-|content-type|npm-)' /tmp/resp.headers || true
+          echo "--- RESPONSE BODY (token redacted) ---"
+          jq 'if .token then (.token="REDACTED_LEN="+(.token|tostring|length|tostring)) else . end' /tmp/resp.json 2>/dev/null || cat /tmp/resp.json
+          case "$HTTP" in
+            201) echo "VERDICT: exchange ISSUED a publish token from this repository." ;;
+            403) echo "VERDICT: binding exists but this token's claims were rejected." ;;
+            404) echo "VERDICT: no config matched (none / expired / slug, file or id mismatch)." ;;
+            *)   echo "VERDICT: unexpected status $HTTP — read the body." ;;
+          esac
